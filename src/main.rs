@@ -13,13 +13,12 @@ use tokio::fs::File;
 use tokio::sync::mpsc;  // 引入 tokio 的通道
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncSeekExt;
+use tokio::io::AsyncWriteExt;
 use ctrlc;
 use hostname::get as get_hostname;
 use reqwest::Client;  // 使用 reqwest 的异步客户端
-use std::io::Write;
 use indicatif::{ProgressBar, ProgressStyle};  // 进度条
 use urlencoding::{encode, decode};  // URL 编码和解码
-use futures::StreamExt;  // 引入 StreamExt 以使用 next() 方法
 use crossterm::event::{self, Event, KeyCode};
 use crossterm::terminal::{Clear, ClearType};  // 引入清屏功能
 use crossterm::execute;  // 引入执行终端命令的功能
@@ -50,6 +49,10 @@ struct Cli {
     /// SSDP 通知的 TTL（Time To Live）
     #[clap(short = 't', long = "ttl", value_name = "TTL", help = "TTL for SSDP notifications (default: 4)", default_value = "4")]
     ttl: u32,
+
+    /// 分块数量（仅在接收模式下使用，默认值为 4）
+    #[clap(short = 'c', long = "chunk", value_name = "CHUNK_COUNT", help = "Number of chunks to divide the file into (default: 4)", default_value = "4")]
+    chunk_count: u64,
 }
 
 /// 获取本地 IP 地址
@@ -195,7 +198,7 @@ fn send_ssdp_notifications(port: u16, stop_signal: Arc<AtomicBool>, device_name:
 
 
 /// 接收端模式
-async fn receive_mode() {
+async fn receive_mode(chunk_count: u64) {
     let socket = UdpSocket::bind("0.0.0.0:1900").expect("Could not bind socket");
     socket.join_multicast_v4(&Ipv4Addr::new(239, 255, 255, 250), &Ipv4Addr::new(0, 0, 0, 0))
         .expect("Could not join multicast group");
@@ -275,8 +278,8 @@ async fn receive_mode() {
                         let (device_name, location) = &devices[choice - 1];
                         println!("Downloading from device: {}", device_name);
 
-                        // 下载文件
-                        download_file(location).await;
+                        // 下载文件，传递 chunk_count 参数
+                        download_file(location, chunk_count).await;
                     } else {
                         println!("Invalid choice.");
                     }
@@ -297,8 +300,8 @@ fn extract_field(message: &str, field: &str) -> String {
         .unwrap_or_default()
 }
 
-/// 下载文件
-async fn download_file(url: &str) {
+/// 下载文件（支持按块数分块下载）
+async fn download_file(url: &str, chunk_count: u64) {
     let client = Client::new();
     if let Ok(response) = client.get(url).send().await {
         // 从响应头中提取文件名
@@ -321,9 +324,15 @@ async fn download_file(url: &str) {
 
         // 解码文件名
         let decoded_file_name = decode(&file_name).expect("Failed to decode file name");
+        let decoded_file_name = decoded_file_name.into_owned(); // 将 Cow<'_, str> 转换为 String
 
         // 获取文件大小
         let total_size = response.content_length().unwrap_or(0);
+        println!("File size: {} bytes", total_size);
+
+        // 计算每个块的大小
+        let chunk_size = (total_size + chunk_count - 1) / chunk_count; // 向上取整
+        println!("Downloading in {} chunks, each chunk size: {} bytes", chunk_count, chunk_size);
 
         // 创建进度条
         let pb = ProgressBar::new(total_size);
@@ -334,23 +343,47 @@ async fn download_file(url: &str) {
                 .progress_chars("#>-")
         );
 
-        // 保存文件
-        if let Ok(mut file) = std::fs::File::create(&*decoded_file_name) {
-            let mut downloaded: u64 = 0;
-            let mut stream = response.bytes_stream();
 
-            // 逐块读取数据
-            while let Some(chunk) = stream.next().await {
-                let chunk = chunk.expect("Failed to read chunk");
-                file.write_all(&chunk).expect("Failed to write to file");
-                downloaded += chunk.len() as u64;
-                pb.set_position(downloaded);
-            }
 
-            pb.finish_with_message(format!("Downloaded {}", decoded_file_name));
-        } else {
-            eprintln!("Failed to create file: {}", decoded_file_name);
+        // 使用 tokio 的异步任务并发下载分块
+        let mut handles = vec![];
+        for chunk_index in 0..chunk_count {
+            let start = chunk_index * chunk_size;
+            let end = std::cmp::min(start + chunk_size - 1, total_size - 1);
+
+            let url = url.to_string();
+            let pb = pb.clone();
+            let client = client.clone();
+            let decoded_file_name = decoded_file_name.clone(); // 克隆文件名
+
+            let handle = tokio::spawn(async move {
+                let range_header = format!("bytes={}-{}", start, end);
+                if let Ok(response) = client.get(&url).header("Range", range_header).send().await {
+                    if let Ok(chunk_data) = response.bytes().await {
+                        // 将分块数据写入文件的指定位置
+                        let mut file = tokio::fs::OpenOptions::new()
+                            .write(true)
+                            .open(&decoded_file_name) // 使用 &String，它实现了 AsRef<Path>
+                            .await
+                            .expect("Failed to open file");
+                        file.seek(std::io::SeekFrom::Start(start)).await.unwrap();
+                        file.write_all(&chunk_data).await.unwrap();
+
+                        // 更新进度条
+                        pb.inc(chunk_data.len() as u64);
+                    }
+                }
+            });
+
+            handles.push(handle);
         }
+
+        // 等待所有分块下载完成
+        for handle in handles {
+            handle.await.unwrap();
+        }
+
+        pb.finish_with_message(format!("Downloaded {}", decoded_file_name));
     } else {
         eprintln!("Failed to download file from {}", url);
     }
@@ -415,7 +448,7 @@ fn main() {
         }
     } else if args.receive {
         let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(receive_mode());
+        rt.block_on(receive_mode(args.chunk_count));  // 传递 chunk_count 参数
     }
 
     return;
