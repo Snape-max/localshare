@@ -44,6 +44,10 @@ struct Cli {
     /// HTTP 服务器端口（仅在发送模式下使用）
     #[clap(short, long, value_name = "PORT", help = "Port for the HTTP server (default: 6654)", default_value = "6654")]
     port: u16,
+
+    /// SSDP 通知的 TTL（Time To Live）
+    #[clap(short = 't', long = "ttl", value_name = "TTL", help = "TTL for SSDP notifications (default: 4)", default_value = "4")]
+    ttl: u32,
 }
 
 /// 获取本地 IP 地址
@@ -128,10 +132,10 @@ async fn start_http_server(file_path: PathBuf, port: u16, stop_signal: Arc<Atomi
 }
 
 /// 发送 SSDP 通知
-fn send_ssdp_notifications(port: u16, stop_signal: Arc<AtomicBool>, device_name: String) {
+fn send_ssdp_notifications(port: u16, stop_signal: Arc<AtomicBool>, device_name: String, ttl: u32) {
     let socket = UdpSocket::bind("0.0.0.0:0").expect("Could not bind socket");
     socket.set_broadcast(true).expect("set_broadcast failed");
-    socket.set_ttl(2).expect("set_ttl failed");
+    socket.set_ttl(ttl).expect("set_ttl failed");  // 使用传入的 ttl 参数
 
     let target: SocketAddr = "239.255.255.250:1900".parse().unwrap();
     let local_ip = get_local_ip();
@@ -372,8 +376,9 @@ fn main() {
 
             // 启动 SSDP 通知线程
             let stop_signal_ssdp = stop_signal.clone();
+            let ttl = args.ttl;  // 获取 ttl 参数
             let ssdp_handle = thread::spawn(move || {
-                send_ssdp_notifications(port, stop_signal_ssdp, device_name);
+                send_ssdp_notifications(port, stop_signal_ssdp, device_name, ttl);  // 传递 ttl 参数
             });
 
             // 等待线程完成
