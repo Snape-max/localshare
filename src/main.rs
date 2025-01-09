@@ -10,10 +10,17 @@ use std::thread;
 use std::time::Duration;
 use tokio::fs::File;
 use tokio::io::AsyncReadExt;
+use tokio::sync::mpsc;  // 引入 tokio 的通道
 use ctrlc;
 use hostname::get as get_hostname;
-use reqwest::blocking::get;
-use std::io::{self, Write};
+use reqwest::Client;  // 使用 reqwest 的异步客户端
+use std::io::Write;
+use indicatif::{ProgressBar, ProgressStyle};  // 进度条
+use urlencoding::{encode, decode};  // URL 编码和解码
+use futures::StreamExt;  // 引入 StreamExt 以使用 next() 方法
+use crossterm::event::{self, Event, KeyCode};
+use crossterm::terminal::{Clear, ClearType};  // 引入清屏功能
+use crossterm::execute;  // 引入执行终端命令的功能
 
 #[derive(Parser, Debug)]
 #[clap(name = "localshare", author = "Luke", version = "1.0", about = "A simple local file sharing tool.", long_about = None)]
@@ -53,9 +60,10 @@ async fn file_handler(file_path: Arc<PathBuf>, file_name: Arc<String>, req: Requ
         if let Ok(mut file) = File::open(&*file_path).await {
             let mut contents = Vec::new();
             if file.read_to_end(&mut contents).await.is_ok() {
-                // 设置响应头，指定下载文件名
+                // 设置响应头，指定下载文件名（URL 编码）
+                let encoded_file_name = encode(&file_name);
                 let response = Response::builder()
-                    .header("Content-Disposition", format!("attachment; filename=\"{}\"", file_name))
+                    .header("Content-Disposition", format!("attachment; filename=\"{}\"", encoded_file_name))
                     .body(Body::from(contents))
                     .unwrap();
                 return Ok(response);
@@ -67,7 +75,6 @@ async fn file_handler(file_path: Arc<PathBuf>, file_name: Arc<String>, req: Requ
             .body(Body::from("Failed to read file"))
             .unwrap())
     } else {
-        // 路径不匹配
         Ok(Response::builder()
             .status(StatusCode::NOT_FOUND)
             .body(Body::from("Not found"))
@@ -157,21 +164,42 @@ fn send_ssdp_notifications(port: u16, stop_signal: Arc<AtomicBool>, device_name:
 }
 
 
-
 /// 接收端模式
-fn receive_mode() {
+async fn receive_mode() {
     let socket = UdpSocket::bind("0.0.0.0:1900").expect("Could not bind socket");
     socket.join_multicast_v4(&Ipv4Addr::new(239, 255, 255, 250), &Ipv4Addr::new(0, 0, 0, 0))
         .expect("Could not join multicast group");
 
     let mut buffer = [0; 1024];
     let mut devices = Vec::new();
+    let mut last_devices_len = 0;  // 缓存上一次的设备列表长度
 
-    println!("Listening for senders...");
+    println!("Listening for senders... (Press 'q' to quit)");
 
-    // 监听 SSDP 消息 10 秒
-    let start_time = std::time::Instant::now();
-    while start_time.elapsed() < Duration::from_secs(10) {
+    // 创建一个通道用于接收用户输入
+    let (tx, mut rx) = mpsc::channel(32);
+
+    // 启动异步任务监听用户输入
+    tokio::spawn(async move {
+        loop {
+            if let Ok(event) = event::read() {
+                if let Event::Key(key_event) = event {
+                    if let KeyCode::Char(c) = key_event.code {
+                        if tx.send(c).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    // 主循环
+    loop {
+        // 设置超时时间为 100ms，以便能够及时处理用户输入
+        socket.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+
+        // 监听 SSDP 消息
         if let Ok((size, _)) = socket.recv_from(&mut buffer) {
             let message = String::from_utf8_lossy(&buffer[..size]);
             if message.contains("SERVER: localshare/1.0") {
@@ -182,43 +210,53 @@ fn receive_mode() {
                     let device_info = (device_name.clone(), location.clone());
                     if !devices.contains(&device_info) {
                         devices.push(device_info.clone());
-                        println!("Found device: {}, Location: {}", device_name, location);
                     }
                 }
             }
         }
-    }
 
-    if devices.is_empty() {
-        println!("No devices found.");
-        return;
-    }
+        // 如果设备列表发生变化，更新显示
+        if devices.len() != last_devices_len {
+            // 清空之前的设备列表显示
+            execute!(std::io::stdout(), Clear(ClearType::FromCursorDown)).unwrap();
 
-    // 显示设备列表供用户选择
-    println!("\nSelect a device to download from:");
-    for (i, (device_name, location)) in devices.iter().enumerate() {
-        println!("{}. Device: {}, Location: {}", i + 1, device_name, location);
-    }
+            // 显示设备列表
+            if !devices.is_empty() {
+                println!("\nSelect a device to download from:");
+                for (i, (device_name, location)) in devices.iter().enumerate() {
+                    println!("{}. Device: {}, Location: {}", i + 1, device_name, location);
+                }
+            }
 
-    // 获取用户输入
-    let mut input = String::new();
-    println!("Enter the number of the device: ");
-    io::stdin().read_line(&mut input).expect("Failed to read input");
-
-    if let Ok(choice) = input.trim().parse::<usize>() {
-        if choice > 0 && choice <= devices.len() {
-            let (device_name, location) = &devices[choice - 1];
-            println!("Downloading from device: {}", device_name);
-
-            // 下载文件
-            download_file(location);
-        } else {
-            println!("Invalid choice.");
+            // 更新缓存的设备列表长度
+            last_devices_len = devices.len();
         }
-    } else {
-        println!("Invalid input.");
+
+        // 检查用户输入
+        if let Ok(c) = rx.try_recv() {
+            match c {
+                'q' => {
+                    println!("Exiting...");
+                    break;
+                }
+                c if c.is_digit(10) => {
+                    let choice = c.to_digit(10).unwrap() as usize;
+                    if choice > 0 && choice <= devices.len() {
+                        let (device_name, location) = &devices[choice - 1];
+                        println!("Downloading from device: {}", device_name);
+
+                        // 下载文件
+                        download_file(location).await;
+                    } else {
+                        println!("Invalid choice.");
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 }
+
 
 /// 从 SSDP 消息中提取字段
 fn extract_field(message: &str, field: &str) -> String {
@@ -230,8 +268,9 @@ fn extract_field(message: &str, field: &str) -> String {
 }
 
 /// 下载文件
-fn download_file(url: &str) {
-    if let Ok(response) = get(url) {
+async fn download_file(url: &str) {
+    let client = Client::new();
+    if let Ok(response) = client.get(url).send().await {
         // 从响应头中提取文件名
         let file_name = response
             .headers()
@@ -250,19 +289,43 @@ fn download_file(url: &str) {
                 url.split('/').last().unwrap_or("file").to_string()
             });
 
-        // 保存文件
-        if let Ok(mut file) = std::fs::File::create(&file_name) {
-            if let Ok(content) = response.bytes() {
-                if file.write_all(&content).is_ok() {
-                    println!("File downloaded successfully: {}", file_name);
-                    return;
-                }
-            }
-        }
-    }
-    eprintln!("Failed to download file from {}", url);
-}
+        // 解码文件名
+        let decoded_file_name = decode(&file_name).expect("Failed to decode file name");
 
+        // 获取文件大小
+        let total_size = response.content_length().unwrap_or(0);
+
+        // 创建进度条
+        let pb = ProgressBar::new(total_size);
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})")
+                .expect("Failed to set progress bar template")
+                .progress_chars("#>-")
+        );
+
+        // 保存文件
+        if let Ok(mut file) = std::fs::File::create(&*decoded_file_name) {
+            let mut downloaded: u64 = 0;
+            let mut stream = response.bytes_stream();
+
+            // 逐块读取数据
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.expect("Failed to read chunk");
+                file.write_all(&chunk).expect("Failed to write to file");
+                downloaded += chunk.len() as u64;
+                pb.set_position(downloaded);
+            }
+
+            pb.finish_with_message(format!("Downloaded {}", decoded_file_name));
+        } else {
+            eprintln!("Failed to create file: {}", decoded_file_name);
+        }
+    } else {
+        eprintln!("Failed to download file from {}", url);
+    }
+    exit(0);
+}
 
 fn main() {
     let args = Cli::parse();
@@ -320,7 +383,8 @@ fn main() {
             eprintln!("Error: --file is required in send mode.");
         }
     } else if args.receive {
-        receive_mode();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(receive_mode());
     }
 
     return;
