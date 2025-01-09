@@ -766,6 +766,7 @@ dependencies = [
  "indicatif",
  "reqwest",
  "tokio",
+ "tokio-util",
  "urlencoding",
 ]
 

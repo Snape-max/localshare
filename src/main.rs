@@ -1,6 +1,7 @@
 use clap::{ArgGroup, Parser, CommandFactory};
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Request, Response, Server, StatusCode};
+use hyper::header::RANGE;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::path::PathBuf;
 use std::process::exit;
@@ -9,8 +10,9 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use tokio::fs::File;
-use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;  // 引入 tokio 的通道
+use tokio::io::AsyncReadExt;
+use tokio::io::AsyncSeekExt;
 use ctrlc;
 use hostname::get as get_hostname;
 use reqwest::Client;  // 使用 reqwest 的异步客户端
@@ -60,30 +62,54 @@ fn get_local_ip() -> String {
 /// HTTP 文件服务处理函数
 async fn file_handler(file_path: Arc<PathBuf>, file_name: Arc<String>, req: Request<Body>) -> Result<Response<Body>, hyper::Error> {
     if req.uri().path() == "/file" {
-        // 打开文件
-        if let Ok(mut file) = File::open(&*file_path).await {
-            let mut contents = Vec::new();
-            if file.read_to_end(&mut contents).await.is_ok() {
-                // 设置响应头，指定下载文件名（URL 编码）
-                let encoded_file_name = encode(&file_name);
-                let response = Response::builder()
-                    .header("Content-Disposition", format!("attachment; filename=\"{}\"", encoded_file_name))
-                    .body(Body::from(contents))
-                    .unwrap();
-                return Ok(response);
-            }
+        if let Ok(file) = File::open(&*file_path).await {
+            let metadata = file.metadata().await.unwrap();
+            let file_size = metadata.len();
+
+            // 检查是否有 Range 请求
+            let (start, end) = if let Some(range_header) = req.headers().get(RANGE) {
+                let range = range_header.to_str().unwrap_or("");
+                if range.starts_with("bytes=") {
+                    let range = &range[6..];
+                    let parts: Vec<&str> = range.split('-').collect();
+                    let start = parts[0].parse::<u64>().unwrap_or(0);
+                    let end = parts.get(1).and_then(|s| s.parse::<u64>().ok()).unwrap_or(file_size - 1);
+                    (start, end)
+                } else {
+                    (0, file_size - 1)
+                }
+            } else {
+                (0, file_size - 1)
+            };
+
+            // 计算分块大小
+            let chunk_size = end - start + 1;
+
+            // 打开文件并跳转到起始位置
+            let mut file = file;
+            file.seek(std::io::SeekFrom::Start(start)).await.unwrap();
+
+            // 创建流
+            let stream = tokio_util::io::ReaderStream::new(file.take(chunk_size));
+            let body = Body::wrap_stream(stream);
+
+            // 构建响应
+            let response = Response::builder()
+                .header("Content-Disposition", format!("attachment; filename=\"{}\"", encode(&file_name)))
+                .header("Content-Length", chunk_size)
+                .header("Accept-Ranges", "bytes")
+                .header("Content-Range", format!("bytes {}-{}/{}", start, end, file_size))
+                .status(StatusCode::PARTIAL_CONTENT) // 206 Partial Content
+                .body(body)
+                .unwrap();
+
+            return Ok(response);
         }
-        // 文件读取失败
-        Ok(Response::builder()
-            .status(StatusCode::INTERNAL_SERVER_ERROR)
-            .body(Body::from("Failed to read file"))
-            .unwrap())
-    } else {
-        Ok(Response::builder()
-            .status(StatusCode::NOT_FOUND)
-            .body(Body::from("Not found"))
-            .unwrap())
     }
+    Ok(Response::builder()
+        .status(StatusCode::NOT_FOUND)
+        .body(Body::from("Not found"))
+        .unwrap())
 }
 
 /// 检查文件是否存在
@@ -163,7 +189,7 @@ fn send_ssdp_notifications(port: u16, stop_signal: Arc<AtomicBool>, device_name:
             Err(e) => eprintln!("Failed to send SSDP notification: {}", e),
         }
 
-        thread::sleep(Duration::from_secs(5));
+        thread::sleep(Duration::from_secs(3));
     }
 }
 
@@ -201,7 +227,7 @@ async fn receive_mode() {
     // 主循环
     loop {
         // 设置超时时间为 100ms，以便能够及时处理用户输入
-        socket.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+        socket.set_read_timeout(Some(Duration::from_millis(250))).unwrap();
 
         // 监听 SSDP 消息
         if let Ok((size, _)) = socket.recv_from(&mut buffer) {
