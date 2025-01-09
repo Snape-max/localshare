@@ -22,6 +22,7 @@ use urlencoding::{encode, decode};  // URL 编码和解码
 use crossterm::event::{self, Event, KeyCode};
 use crossterm::terminal::{Clear, ClearType};  // 引入清屏功能
 use crossterm::execute;  // 引入执行终端命令的功能
+use futures::StreamExt; // 引入 StreamExt 以使用 next() 方法
 
 #[derive(Parser, Debug)]
 #[clap(name = "localshare", author = "Luke", version = "1.0", about = "A simple local file sharing tool.", long_about = None)]
@@ -301,6 +302,7 @@ fn extract_field(message: &str, field: &str) -> String {
 }
 
 /// 下载文件（支持按块数分块下载）
+/// 下载文件（支持按块数分块下载）
 async fn download_file(url: &str, chunk_count: u64) {
     let client = Client::new();
     if let Ok(response) = client.get(url).send().await {
@@ -343,7 +345,13 @@ async fn download_file(url: &str, chunk_count: u64) {
                 .progress_chars("#>-")
         );
 
-
+        // 创建文件
+        let file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .open(&decoded_file_name)
+            .await
+            .expect("Failed to create file");
 
         // 使用 tokio 的异步任务并发下载分块
         let mut handles = vec![];
@@ -354,23 +362,24 @@ async fn download_file(url: &str, chunk_count: u64) {
             let url = url.to_string();
             let pb = pb.clone();
             let client = client.clone();
-            let decoded_file_name = decoded_file_name.clone(); // 克隆文件名
+            let mut file = file.try_clone().await.expect("Failed to clone file handle"); // 克隆文件句柄
 
             let handle = tokio::spawn(async move {
                 let range_header = format!("bytes={}-{}", start, end);
                 if let Ok(response) = client.get(&url).header("Range", range_header).send().await {
-                    if let Ok(chunk_data) = response.bytes().await {
-                        // 将分块数据写入文件的指定位置
-                        let mut file = tokio::fs::OpenOptions::new()
-                            .write(true)
-                            .open(&decoded_file_name) // 使用 &String，它实现了 AsRef<Path>
-                            .await
-                            .expect("Failed to open file");
-                        file.seek(std::io::SeekFrom::Start(start)).await.unwrap();
-                        file.write_all(&chunk_data).await.unwrap();
+                    let mut stream = response.bytes_stream();
+                    let mut downloaded_bytes = 0;
 
-                        // 更新进度条
-                        pb.inc(chunk_data.len() as u64);
+                    while let Some(chunk) = stream.next().await {
+                        if let Ok(chunk_data) = chunk {
+                            // 将分块数据写入文件的指定位置
+                            file.seek(std::io::SeekFrom::Start(start + downloaded_bytes)).await.unwrap();
+                            file.write_all(&chunk_data).await.unwrap();
+
+                            // 更新进度条
+                            pb.inc(chunk_data.len() as u64); // 实时更新进度条
+                            downloaded_bytes += chunk_data.len() as u64;
+                        }
                     }
                 }
             });
