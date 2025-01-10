@@ -343,7 +343,7 @@ async fn download_file(url: &str, chunk_count: u64) {
 
         // 创建临时文件路径
         let temp_dir = std::env::temp_dir();
-        println!("Writing in temporary directory: {}", temp_dir.display());
+        println!("Writing chunks in temporary directory: {}", temp_dir.display());
         let mut temp_files = Vec::new();
 
         // 启动多个下载任务
@@ -385,7 +385,7 @@ async fn download_file(url: &str, chunk_count: u64) {
         for task in tasks {
             task.await.unwrap();
         }
-
+        println!("Merging into one file...");
         // 合并临时文件
         let mut output_file = tokio::fs::File::create(&decoded_file_name).await.unwrap();
         for temp_path in temp_files {
