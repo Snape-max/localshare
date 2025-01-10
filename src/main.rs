@@ -7,7 +7,7 @@ use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Request, Response, Server, StatusCode};
 use hyper::header::RANGE;
 use hostname::get as get_hostname;
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::ProgressBar;
 use reqwest::Client;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::path::PathBuf;
@@ -18,7 +18,7 @@ use std::thread;
 use std::time::Duration;
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::mpsc;
 use urlencoding::{encode, decode};
 
 
@@ -334,70 +334,69 @@ async fn download_file(url: &str, chunk_count: u64) {
         let chunk_size = (total_size + chunk_count - 1) / chunk_count; // 向上取整
         println!("Downloading in {} chunks, each chunk size: {} bytes", chunk_count, chunk_size);
 
-        // 创建进度条
-        let pb = ProgressBar::new(total_size);
-        pb.set_style(
-            ProgressStyle::default_bar()
-                .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})")
-                .expect("Failed to set progress bar template")
-                .progress_chars("#>-")
-        );
+        // 创建多进度条管理器
+        let multi_progress = indicatif::MultiProgress::new();
+        let progress_bar_templates = indicatif::ProgressStyle::default_bar()
+            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})")
+            .expect("Failed to set progress bar template")
+            .progress_chars("#>-");
 
-// 创建文件
-let file = Arc::new(Mutex::new(
-    tokio::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .open(&decoded_file_name)
-        .await
-        .expect("Failed to create file"),
-));
+        // 创建临时文件路径
+        let temp_dir = std::env::temp_dir();
+        println!("Writing in temporary directory: {}", temp_dir.display());
+        let mut temp_files = Vec::new();
 
-        // 使用 tokio 的异步任务并发下载分块
-        let mut handles = vec![];
+        // 启动多个下载任务
+        let mut tasks = Vec::new();
         for chunk_index in 0..chunk_count {
             let start = chunk_index * chunk_size;
             let end = std::cmp::min(start + chunk_size - 1, total_size - 1);
 
             let url = url.to_string();
-            let pb = pb.clone();
             let client = client.clone();
-            let file_clone = file.clone();
+            let temp_path = temp_dir.join(format!("{}.part{}", decoded_file_name, chunk_index));
+            temp_files.push(temp_path.clone());
 
-            let handle = tokio::spawn(async move {
+            // 创建进度条
+            let pb = multi_progress.add(ProgressBar::new(chunk_size + 1)); // +1 to prevent division by zero
+            pb.set_style(progress_bar_templates.clone());
+
+            // 下载任务
+            let task = tokio::spawn(async move {
                 let range_header = format!("bytes={}-{}", start, end);
                 if let Ok(response) = client.get(&url).header("Range", range_header).send().await {
-                    let mut stream = response.bytes_stream();
+                    let mut file = tokio::fs::File::create(&temp_path).await.unwrap();
                     let mut downloaded_bytes = 0;
-
+                    let mut stream = response.bytes_stream();
                     while let Some(chunk) = stream.next().await {
                         if let Ok(chunk_data) = chunk {
-                            // 获取文件锁并写入数据
-                            let mut file = file_clone.lock().await;
-                            file.seek(std::io::SeekFrom::Start(start + downloaded_bytes))
-                                .await
-                                .unwrap();
-                            file.write_all(&chunk_data)
-                                .await
-                                .unwrap();
-
-                            // 更新进度条
-                            pb.inc(chunk_data.len() as u64); // 实时更新进度条
+                            file.write_all(&chunk_data).await.unwrap();
                             downloaded_bytes += chunk_data.len() as u64;
+                            pb.inc(chunk_data.len() as u64);
                         }
                     }
                 }
+                pb.finish();
             });
-
-            handles.push(handle);
+            tasks.push(task);
         }
 
-        // 等待所有分块下载完成
-        for handle in handles {
-            handle.await.unwrap();
+        // 等待所有任务完成
+        for task in tasks {
+            task.await.unwrap();
         }
 
-        pb.finish_with_message(format!("Downloaded {}", decoded_file_name));
+        // 合并临时文件
+        let mut output_file = tokio::fs::File::create(&decoded_file_name).await.unwrap();
+        for temp_path in temp_files {
+            let mut file = tokio::fs::File::open(&temp_path).await.unwrap();
+            let mut buffer = Vec::new();
+            file.read_to_end(&mut buffer).await.unwrap();
+            output_file.write_all(&buffer).await.unwrap();
+            tokio::fs::remove_file(&temp_path).await.unwrap();
+        }
+
+        println!("Download complete: {}", decoded_file_name);
     } else {
         eprintln!("Failed to download file from {}", url);
     }
