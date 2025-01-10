@@ -1,7 +1,14 @@
 use clap::{ArgGroup, Parser, CommandFactory};
+use crossterm::event::{self, Event, KeyCode};
+use crossterm::terminal::{Clear, ClearType};
+use crossterm::execute;
+use futures::StreamExt;
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Request, Response, Server, StatusCode};
 use hyper::header::RANGE;
+use hostname::get as get_hostname;
+use indicatif::{ProgressBar, ProgressStyle};
+use reqwest::Client;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::path::PathBuf;
 use std::process::exit;
@@ -10,19 +17,11 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use tokio::fs::File;
-use tokio::sync::mpsc;  // 引入 tokio 的通道
-use tokio::io::AsyncReadExt;
-use tokio::io::AsyncSeekExt;
-use tokio::io::AsyncWriteExt;
-use ctrlc;
-use hostname::get as get_hostname;
-use reqwest::Client;  // 使用 reqwest 的异步客户端
-use indicatif::{ProgressBar, ProgressStyle};  // 进度条
-use urlencoding::{encode, decode};  // URL 编码和解码
-use crossterm::event::{self, Event, KeyCode};
-use crossterm::terminal::{Clear, ClearType};  // 引入清屏功能
-use crossterm::execute;  // 引入执行终端命令的功能
-use futures::StreamExt; // 引入 StreamExt 以使用 next() 方法
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::sync::{mpsc, Mutex};
+use urlencoding::{encode, decode};
+
+
 
 #[derive(Parser, Debug)]
 #[clap(name = "localshare", author = "Luke", version = "1.0", about = "A simple local file sharing tool.", long_about = None)]
@@ -201,8 +200,7 @@ fn send_ssdp_notifications(port: u16, stop_signal: Arc<AtomicBool>, device_name:
 /// 接收端模式
 async fn receive_mode(chunk_count: u64) {
     let socket = UdpSocket::bind("0.0.0.0:1900").expect("Could not bind socket");
-    let interface_addr = get_local_ip().parse::<Ipv4Addr>().expect("Invalid IP address");
-    socket.join_multicast_v4(&Ipv4Addr::new(239, 255, 255, 250), &interface_addr)
+    socket.join_multicast_v4(&Ipv4Addr::new(239, 255, 255, 250), &Ipv4Addr::new(0, 0, 0, 0))
         .expect("Could not join multicast group");
 
     let mut buffer = [0; 1024];
@@ -345,13 +343,15 @@ async fn download_file(url: &str, chunk_count: u64) {
                 .progress_chars("#>-")
         );
 
-        // 创建文件
-        let file = tokio::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .open(&decoded_file_name)
-            .await
-            .expect("Failed to create file");
+// 创建文件
+let file = Arc::new(Mutex::new(
+    tokio::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .open(&decoded_file_name)
+        .await
+        .expect("Failed to create file"),
+));
 
         // 使用 tokio 的异步任务并发下载分块
         let mut handles = vec![];
@@ -362,7 +362,7 @@ async fn download_file(url: &str, chunk_count: u64) {
             let url = url.to_string();
             let pb = pb.clone();
             let client = client.clone();
-            let mut file = file.try_clone().await.expect("Failed to clone file handle"); // 克隆文件句柄
+            let file_clone = file.clone();
 
             let handle = tokio::spawn(async move {
                 let range_header = format!("bytes={}-{}", start, end);
@@ -372,9 +372,14 @@ async fn download_file(url: &str, chunk_count: u64) {
 
                     while let Some(chunk) = stream.next().await {
                         if let Ok(chunk_data) = chunk {
-                            // 将分块数据写入文件的指定位置
-                            file.seek(std::io::SeekFrom::Start(start + downloaded_bytes)).await.unwrap();
-                            file.write_all(&chunk_data).await.unwrap();
+                            // 获取文件锁并写入数据
+                            let mut file = file_clone.lock().await;
+                            file.seek(std::io::SeekFrom::Start(start + downloaded_bytes))
+                                .await
+                                .unwrap();
+                            file.write_all(&chunk_data)
+                                .await
+                                .unwrap();
 
                             // 更新进度条
                             pb.inc(chunk_data.len() as u64); // 实时更新进度条
