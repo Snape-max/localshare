@@ -765,6 +765,7 @@ dependencies = [
  "hyper",
  "indicatif",
  "reqwest",
+ "tempfile",
  "tokio",
  "tokio-util",
  "urlencoding",

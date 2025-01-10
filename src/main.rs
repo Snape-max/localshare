@@ -201,7 +201,8 @@ fn send_ssdp_notifications(port: u16, stop_signal: Arc<AtomicBool>, device_name:
 /// 接收端模式
 async fn receive_mode(chunk_count: u64) {
     let socket = UdpSocket::bind("0.0.0.0:1900").expect("Could not bind socket");
-    socket.join_multicast_v4(&Ipv4Addr::new(239, 255, 255, 250), &Ipv4Addr::new(0, 0, 0, 0))
+    let interface_addr = get_local_ip().parse::<Ipv4Addr>().expect("Invalid IP address");
+    socket.join_multicast_v4(&Ipv4Addr::new(239, 255, 255, 250), &interface_addr)
         .expect("Could not join multicast group");
 
     let mut buffer = [0; 1024];
@@ -301,7 +302,6 @@ fn extract_field(message: &str, field: &str) -> String {
         .unwrap_or_default()
 }
 
-/// 下载文件（支持按块数分块下载）
 /// 下载文件（支持按块数分块下载）
 async fn download_file(url: &str, chunk_count: u64) {
     let client = Client::new();
